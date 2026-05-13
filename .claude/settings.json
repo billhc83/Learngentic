@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "learngentic": {
+      "command": "C:\\Learngentic\\venv\\Scripts\\python.exe",
+      "args": ["-m", "learngentic.mcp.server"]
+    }
+  }
+}
