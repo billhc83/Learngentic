@@ -33,19 +33,7 @@ app = Server("learngentic")
 
 
 def _ensure_api_key() -> None:
-    """Load API key from ~/.learngentic/config.json if not already in env."""
-    import os
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return
-    config_path = Path.home() / ".learngentic" / "config.json"
-    if config_path.exists():
-        try:
-            cfg = json.loads(config_path.read_text())
-            key = cfg.get("anthropic_api_key", "")
-            if key:
-                os.environ["ANTHROPIC_API_KEY"] = key
-        except (json.JSONDecodeError, OSError):
-            pass
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -640,12 +628,7 @@ def _fire_git_ingest_async(session_id: str, cwd: str, started_at: str) -> None:
             if not cwd:
                 return
 
-            # Normalise WSL-style paths (/mnt/c/...) to Windows paths (C:\...)
-            norm_cwd = cwd
-            if cwd.startswith("/mnt/") and len(cwd) > 6:
-                norm_cwd = cwd[5].upper() + ":" + cwd[6:].replace("/", "\\")
-
-            root = find_repo_root(norm_cwd)
+            root = find_repo_root(cwd)
             if not root:
                 return
 

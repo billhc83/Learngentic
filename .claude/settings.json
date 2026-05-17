@@ -1,8 +1,17 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python3 -c ' *)",
+      "Bash(.venv/bin/learngentic sessions *)"
+    ]
+  },
   "mcpServers": {
     "learngentic": {
       "command": "C:\\Learngentic\\venv\\Scripts\\python.exe",
-      "args": ["-m", "learngentic.mcp.server"]
+      "args": [
+        "-m",
+        "learngentic.mcp.server"
+      ]
     }
   }
 }

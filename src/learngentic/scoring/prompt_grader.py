@@ -1,19 +1,35 @@
-"""
-LLM retrospective prompt grader.
-
-Runs once per session after completion. Reads the initial prompt,
-the reprompt sequence, and the user's outcome rating, then asks
-Claude to score the initial prompt and tag its failure modes.
-
-The key question: "What information, present by turn N, was absent from turn 1?"
-"""
 from __future__ import annotations
 
 import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
-import anthropic
+from openai import OpenAI
+
+
+def _ollama_client() -> OpenAI:
+    config_path = Path.home() / ".learngentic" / "config.json"
+    base_url = "http://localhost:11434/v1"
+    if config_path.exists():
+        try:
+            cfg = json.loads(config_path.read_text())
+            base_url = cfg.get("ollama_base_url", base_url)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return OpenAI(base_url=base_url, api_key="ollama")
+
+
+def _ollama_model() -> str:
+    config_path = Path.home() / ".learngentic" / "config.json"
+    if config_path.exists():
+        try:
+            cfg = json.loads(config_path.read_text())
+            return cfg.get("ollama_model", "hermes3")
+        except (json.JSONDecodeError, OSError):
+            pass
+    return "hermes3"
+
 
 VALID_FAILURE_MODES = {
     "missing_acceptance_criteria",
@@ -86,29 +102,29 @@ def grade_session(
     reprompts: list[str],
     outcome_rating: float,
     turn_count: int,
-    model: str = "claude-haiku-4-5-20251001",
+    model: str | None = None,
 ) -> GraderResult:
-    """
-    Call Claude to grade the initial prompt quality for a completed session.
-    Uses Haiku for cost efficiency — this runs on every session.
-    """
-    client = anthropic.Anthropic()
+    """Grade the initial prompt quality using the local Ollama model."""
+    client = _ollama_client()
+    if model is None:
+        model = _ollama_model()
 
-    response = client.messages.create(
+    response = client.chat.completions.create(
         model=model,
         max_tokens=256,
-        system=GRADER_SYSTEM,
-        messages=[{
-            "role": "user",
-            "content": _build_user_message(
-                initial_prompt, reprompts, outcome_rating, turn_count
-            ),
-        }],
+        messages=[
+            {"role": "system", "content": GRADER_SYSTEM},
+            {
+                "role": "user",
+                "content": _build_user_message(
+                    initial_prompt, reprompts, outcome_rating, turn_count
+                ),
+            },
+        ],
     )
 
-    raw = response.content[0].text.strip()
+    raw = response.choices[0].message.content.strip()
 
-    # Extract JSON even if model adds surrounding text
     json_match = re.search(r'\{.*\}', raw, re.DOTALL)
     if not json_match:
         return GraderResult(

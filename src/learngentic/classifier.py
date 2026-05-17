@@ -1,17 +1,12 @@
-"""
-LLM-based classifier for change_type and code_region_type.
-
-Runs once per session at ingest time. Uses the initial prompt +
-file paths touched to assign abstract cross-project labels that
-power the global model.
-"""
 from __future__ import annotations
 
 import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
-import anthropic
+from openai import OpenAI
+
 
 CHANGE_TYPES = {
     "feature_addition",
@@ -21,20 +16,20 @@ CHANGE_TYPES = {
     "test",
     "documentation",
     "dependency_update",
-    "investigation",   # sessions that explore/explain without writing
+    "investigation",
     "other",
 }
 
 CODE_REGION_TYPES = {
     "auth",
-    "data_layer",       # database, ORM, migrations, storage
-    "ui",               # frontend components, templates, styling
-    "api",              # HTTP routes, endpoints, serializers
-    "business_logic",   # domain rules, algorithms, services
-    "infrastructure",   # CI/CD, config, Docker, env
+    "data_layer",
+    "ui",
+    "api",
+    "business_logic",
+    "infrastructure",
     "testing",
-    "tooling",          # build, scripts, dev tooling
-    "cross_cutting",    # changes spanning multiple regions
+    "tooling",
+    "cross_cutting",
     "unknown",
 }
 
@@ -61,28 +56,55 @@ class ClassifierResult:
     code_region_type: str
 
 
+def _ollama_client() -> OpenAI:
+    config_path = Path.home() / ".learngentic" / "config.json"
+    base_url = "http://localhost:11434/v1"
+    if config_path.exists():
+        try:
+            cfg = json.loads(config_path.read_text())
+            base_url = cfg.get("ollama_base_url", base_url)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return OpenAI(base_url=base_url, api_key="ollama")
+
+
+def _ollama_model() -> str:
+    config_path = Path.home() / ".learngentic" / "config.json"
+    if config_path.exists():
+        try:
+            cfg = json.loads(config_path.read_text())
+            return cfg.get("ollama_model", "hermes3")
+        except (json.JSONDecodeError, OSError):
+            pass
+    return "hermes3"
+
+
 def classify_session(
     initial_prompt: str,
     files_changed: list[str],
-    model: str = "claude-haiku-4-5-20251001",
+    model: str | None = None,
 ) -> ClassifierResult:
-    """Classify a session's change type and code region using Haiku."""
+    """Classify a session's change type and code region using the local Ollama model."""
     if not initial_prompt and not files_changed:
         return ClassifierResult(change_type="other", code_region_type="unknown")
 
-    client = anthropic.Anthropic()
+    client = _ollama_client()
+    if model is None:
+        model = _ollama_model()
 
     file_list = "\n".join(f"  - {f}" for f in files_changed[:20])
     user_msg = f"PROMPT:\n{initial_prompt or '(empty)'}\n\nFILES CHANGED:\n{file_list or '  (none)'}"
 
-    response = client.messages.create(
+    response = client.chat.completions.create(
         model=model,
         max_tokens=64,
-        system=CLASSIFIER_SYSTEM,
-        messages=[{"role": "user", "content": user_msg}],
+        messages=[
+            {"role": "system", "content": CLASSIFIER_SYSTEM},
+            {"role": "user", "content": user_msg},
+        ],
     )
 
-    raw = response.content[0].text.strip()
+    raw = response.choices[0].message.content.strip()
     json_match = re.search(r'\{.*\}', raw, re.DOTALL)
 
     if not json_match:
