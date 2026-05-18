@@ -137,6 +137,46 @@ async def list_tools() -> list[Tool]:
                 "required": ["session_id", "sent_back", "already_existed", "is_rewrite", "turn_count"],
             },
         ),
+        Tool(
+            name="run_local_task",
+            description=(
+                "Delegate a task to a local Ollama model. "
+                "The server classifies the task, checks whether a local model is capable based on "
+                "historical pass rates, picks the right model, runs it, and logs the attempt. "
+                "If local_capable is false in the response, handle the task yourself — do not retry. "
+                "On a failed attempt, call again with attempt_number incremented, previous_run_id set "
+                "to the last run_id, and a refined system_prompt_override. Max 5 attempts."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task_description":      {"type": "string",  "description": "What you want done — used for classification and logging"},
+                    "user_input":            {"type": "string",  "description": "The content to process (diff, code, text, etc.)"},
+                    "attempt_number":        {"type": "integer", "description": "Attempt number 1–5 (default 1)"},
+                    "system_prompt_override":{"type": "string",  "description": "Override the default system prompt — use on retries to refine"},
+                    "previous_run_id":       {"type": "string",  "description": "run_id from the previous failed attempt — marks it as failed"},
+                    "session_id":            {"type": "string",  "description": "Optional Learngentic session_id to link this attempt"},
+                },
+                "required": ["task_description", "user_input"],
+            },
+        ),
+        Tool(
+            name="report_local_result",
+            description=(
+                "Record whether a local model attempt passed or failed. "
+                "Call with verdict='pass' when you accept the output, 'fail' when retrying, "
+                "or 'gave_up' after 5 failed attempts. This closes the feedback loop for "
+                "fine-tuning data collection."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "run_id":  {"type": "string", "description": "run_id from run_local_task"},
+                    "verdict": {"type": "string", "description": "'pass', 'fail', or 'gave_up'"},
+                },
+                "required": ["run_id", "verdict"],
+            },
+        ),
     ]
 
 
@@ -170,6 +210,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             is_rewrite=bool(arguments.get("is_rewrite", False)),
             turn_count=int(arguments.get("turn_count", 1)),
             hermes_notes=arguments.get("hermes_notes", ""),
+        )
+    elif name == "run_local_task":
+        from learngentic.local_tasks.runner import run_local_task
+        result = run_local_task(
+            task_description=arguments.get("task_description", ""),
+            user_input=arguments.get("user_input", ""),
+            attempt_number=int(arguments.get("attempt_number", 1)),
+            system_prompt_override=arguments.get("system_prompt_override"),
+            previous_run_id=arguments.get("previous_run_id"),
+            session_id=arguments.get("session_id"),
+        )
+    elif name == "report_local_result":
+        from learngentic.local_tasks.runner import report_local_result
+        result = report_local_result(
+            run_id=arguments.get("run_id", ""),
+            verdict=arguments.get("verdict", ""),
         )
     else:
         result = {"error": f"Unknown tool: {name}"}

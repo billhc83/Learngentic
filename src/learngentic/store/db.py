@@ -86,6 +86,23 @@ _SCHEMA_STATEMENTS = [
         last_updated            TEXT,
         PRIMARY KEY (change_type, code_region_type)
     )""",
+    """CREATE TABLE IF NOT EXISTS local_model_runs (
+        run_id          TEXT PRIMARY KEY,
+        task_type       TEXT,
+        task_description TEXT,
+        system_prompt   TEXT,
+        user_input      TEXT,
+        model_output    TEXT,
+        model_used      TEXT,
+        attempt_number  INTEGER,
+        previous_run_id TEXT,
+        session_id      TEXT,
+        verdict         TEXT,
+        local_capable   INTEGER,
+        created_at      TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_lmr_task_type ON local_model_runs(task_type)",
+    "CREATE INDEX IF NOT EXISTS idx_lmr_session   ON local_model_runs(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_ce_session ON change_events(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_ce_file    ON change_events(repo_relative_path)",
     "CREATE INDEX IF NOT EXISTS idx_s_project  ON sessions(project_id)",

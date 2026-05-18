@@ -2,12 +2,18 @@
   "permissions": {
     "allow": [
       "Bash(.venv/bin/python3 -c ' *)",
-      "Bash(.venv/bin/learngentic sessions *)"
+      "Bash(.venv/bin/learngentic sessions *)",
+      "Bash(grep -E \"\\\\.\\(py|json|md|toml|txt\\)$\")",
+      "Bash(.venv/bin/python -c \"from learngentic.local_tasks.runner import run_local_task, report_local_result; print\\('runner imports OK'\\)\")",
+      "Bash(curl -s http://localhost:11434/api/tags)",
+      "Bash(python3 -c \"import sys,json; models=[m['name'] for m in json.load\\(sys.stdin\\).get\\('models',[]\\)]; print\\('\\\\n'.join\\(models\\)\\)\")",
+      "Bash(git -C /mnt/data/projects/Learngentic status)",
+      "Bash(git -C /mnt/data/projects/Learngentic diff HEAD)"
     ]
   },
   "mcpServers": {
     "learngentic": {
-      "command": "C:\\Learngentic\\venv\\Scripts\\python.exe",
+      "command": "/mnt/data/projects/Learngentic/.venv/bin/python3",
       "args": [
         "-m",
         "learngentic.mcp.server"
