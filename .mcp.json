@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "learngentic": {
+      "command": "/mnt/data/projects/Learngentic/.venv/bin/python3",
+      "args": ["-m", "learngentic.mcp.server"]
+    }
+  }
+}
