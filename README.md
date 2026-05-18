@@ -32,8 +32,10 @@ Over time the patterns table improves: a session rated good that gets immediatel
 │  1. Gets task                       │
 │  2. → record_task (MCP)        ─────┼──► Turso DB (creates session row)
 │  3. Works through checklist         │         │
-│  4. → report_outcome (MCP)     ─────┼──► Turso DB (writes hermes_assessment)
-│  5. Returns result                  │         │
+│  4. → run_local_task (MCP)     ─────┼──► Turso DB (logs local model attempt)
+│  5. → report_local_result (MCP)─────┼──► Turso DB (records pass/fail verdict)
+│  6. → report_outcome (MCP)     ─────┼──► Turso DB (writes hermes_assessment)
+│  7. Returns result                  │         │
 └─────────────────────────────────────┘         │
                                                  │
 ┌─────────────────────────────────────┐         │
@@ -56,11 +58,13 @@ The MCP server is the only interface between an agent and Learngentic. Agents ne
 
 ## MCP tools
 
-Five tools are exposed via stdio MCP:
+Seven tools are exposed via stdio MCP:
 
 | Tool | When to call | Returns |
 |------|-------------|---------|
-| `record_task` | Before starting any non-trivial task (>3 turns expected) | `session_id`, `TaskStandard`, file recency warnings |
+| `record_task` | Before starting any non-trivial task | `session_id`, `TaskStandard`, file recency warnings |
+| `run_local_task` | To delegate any subtask to a local Ollama model | `run_id`, `task_type`, `local_capable` flag, `output`, `model_used` |
+| `report_local_result` | After evaluating every `run_local_task` output | Confirmation the verdict was stored |
 | `report_outcome` | Before returning a completed result to the user | Pass/fail verdict, score breakdown, next steps |
 | `query_risk_assessment` | Pre-execution: should we ask clarifying questions? | Risk level, grounded questions from past failures |
 | `query_outcome_history` | Find similar past sessions and their scores | Semantic + classification-matched sessions |
@@ -81,7 +85,20 @@ Create `~/.learngentic/config.json`:
   "turso_url": "libsql://your-db.turso.io",
   "turso_auth_token": "your-token",
   "ollama_base_url": "http://localhost:11434/v1",
-  "ollama_model": "your-model"
+  "ollama_model": "hermes3"
+}
+```
+
+Optionally set per-task-type model overrides:
+
+```json
+{
+  "task_models": {
+    "code_task":         "qwen2.5-coder:14b",
+    "analytical":        "qwen3:14b",
+    "structured_output": "qwen3-14b-nothink",
+    "summarization":     "qwen3-14b-nothink"
+  }
 }
 ```
 
@@ -97,13 +114,13 @@ learngentic status
 python -m learngentic.mcp.server
 ```
 
-Register it as a stdio MCP server in your agent's settings. For Claude Code, add to your MCP config:
+Register it as a stdio MCP server in your agent's settings. For Claude Code on Linux, add to `.claude/settings.json`:
 
 ```json
 {
   "mcpServers": {
     "learngentic": {
-      "command": "python",
+      "command": "/path/to/venv/bin/python3",
       "args": ["-m", "learngentic.mcp.server"]
     }
   }
@@ -120,7 +137,9 @@ learngentic status            # check config, Turso, and Ollama connectivity
 
 ## Agent integration (Hermes / Claude Code)
 
-Before any non-trivial task, the agent calls `record_task`:
+The full task lifecycle has four mandatory MCP calls:
+
+**1. Start — `record_task`**
 
 ```json
 {
@@ -133,7 +152,30 @@ Before any non-trivial task, the agent calls `record_task`:
 
 Response includes a `TaskStandard` with benchmarks and a completion checklist. The checklist is a **gate** — every item must be satisfied before calling `report_outcome`.
 
-After completing the task:
+**2. Local model work — `run_local_task` + `report_local_result`**
+
+For any subtask delegated to a local Ollama model (commit messages, code review, summarization, structured output, etc.):
+
+```json
+{
+  "task_description": "Write a conventional commit message for this diff",
+  "user_input": "<the diff>",
+  "session_id": "abc-123",
+  "attempt_number": 1
+}
+```
+
+The server classifies the task, checks historical pass rates for that task type, selects the appropriate model, runs it, and logs the attempt. If `local_capable` is `false`, handle the subtask yourself.
+
+After evaluating the output, record the verdict:
+
+```json
+{ "run_id": "def-456", "verdict": "pass" }
+```
+
+On a failed attempt, retry with `attempt_number` incremented and `previous_run_id` set to the last `run_id`. Max 5 attempts.
+
+**3. Complete — `report_outcome`**
 
 ```json
 {
@@ -150,9 +192,13 @@ The verdict and any `next_steps` are returned. Git signals arriving after a push
 ## Score lifecycle
 
 ```
-record_task → assessment_source: 'pending'
-report_outcome → assessment_source: 'hermes_self'   (self-rated)
-learngentic score (after push) → assessment_source: 'git_grounded'  (externally validated)
+record_task       → sessions.assessment_source: 'pending'
+report_outcome    → sessions.assessment_source: 'hermes_self'   (self-rated)
+learngentic score → sessions.assessment_source: 'git_grounded'  (externally validated)
+
+run_local_task + report_local_result → logged separately in local_model_runs table
+                                        verdict ('pass'/'fail'/'gave_up') drives
+                                        per-task-type pass rate and model selection
 ```
 
 Self-rated scores are stored in `hermes_assessment`, separate from `outcome_quality`. If git history contradicts the self-rating (file reverted, rapidly reworked), the git signal wins.
@@ -162,7 +208,9 @@ Self-rated scores are stored in `hermes_assessment`, separate from `outcome_qual
 ```
 src/learngentic/
 ├── mcp/
-│   └── server.py          # MCP server — all five tools
+│   └── server.py          # MCP server — all seven tools
+├── local_tasks/
+│   └── runner.py          # local model execution: classify, select model, run, log
 ├── scoring/
 │   ├── bayesian.py        # durability from git history
 │   ├── efficiency.py      # turn count → efficiency score
@@ -180,6 +228,15 @@ src/learngentic/
 ├── classifier.py          # LLM-based prompt → (change_type, region) classifier
 └── cli.py                 # learngentic CLI
 ```
+
+## Hard rules for Claude Code
+
+These are enforced via CLAUDE.md and hooks — not optional:
+
+1. Call `record_task` as the **first action** before any file edits or tool calls.
+2. Use `run_local_task` for **all** local model work — never call Ollama via `curl` or raw HTTP.
+3. Call `report_local_result` immediately after evaluating every `run_local_task` output.
+4. Call `report_outcome` before telling the user a task is done.
 
 ## Development
 
