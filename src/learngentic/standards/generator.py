@@ -92,9 +92,10 @@ def generate_standard(change_type: str, code_region_type: str) -> TaskStandard:
             FROM global_patterns
             WHERE change_type = ? AND code_region_type = ?
         """, (change_type, code_region_type)).fetchone()
+        failure_warning = _recent_failure_warning(change_type, code_region_type, conn)
 
     if not pattern or not pattern.get("sample_count"):
-        return _cold_start_standard(change_type, code_region_type)
+        return _cold_start_standard(change_type, code_region_type, failure_warning)
 
     n = pattern["sample_count"] or 0
     avg_eff = pattern["avg_efficiency"]
@@ -140,6 +141,9 @@ def generate_standard(change_type: str, code_region_type: str) -> TaskStandard:
     if _FINAL_CHECKLIST_ITEM not in checklist:
         checklist.append(_FINAL_CHECKLIST_ITEM)
 
+    if failure_warning:
+        checklist = [failure_warning] + checklist
+
     tier2_available = (avg_oq is not None) or (avg_pq is not None)
     signal_tiers = {
         "tier1_available": (avg_eff is not None) or (avg_dur is not None),
@@ -170,6 +174,48 @@ def generate_standard(change_type: str, code_region_type: str) -> TaskStandard:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _recent_failure_warning(change_type: str, code_region_type: str, conn) -> str | None:
+    """
+    Query recent low-scoring sessions for this task type and return a warning string
+    to prepend to the checklist, or None if the recent history looks healthy.
+    """
+    rows = conn.execute("""
+        SELECT failure_mode_tags FROM sessions
+        WHERE change_type = ? AND code_region_type = ?
+          AND failure_mode_tags IS NOT NULL
+          AND hermes_assessment < 0.5
+        ORDER BY started_at DESC
+        LIMIT 5
+    """, (change_type, code_region_type)).fetchall()
+
+    if not rows:
+        return None
+
+    mode_counts: dict[str, int] = {}
+    for row in rows:
+        try:
+            tags = json.loads(row["failure_mode_tags"])
+            if isinstance(tags, list):
+                for tag in tags:
+                    mode_counts[tag] = mode_counts.get(tag, 0) + 1
+            elif isinstance(tags, dict):
+                for tag, count in tags.items():
+                    mode_counts[tag] = mode_counts.get(tag, 0) + int(count)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    if not mode_counts:
+        return None
+
+    top_mode = max(mode_counts, key=mode_counts.__getitem__)
+    readable = top_mode.replace("_", " ")
+    return (
+        f"[PATTERN WARNING] {len(rows)} recent similar sessions scored poorly. "
+        f"Most common failure: '{readable}'. "
+        "Resolve this explicitly before writing any code."
+    )
+
+
 def _invert_efficiency(eff: float) -> int:
     """Convert an efficiency score back to approximate turn count.
 
@@ -184,7 +230,12 @@ def _invert_efficiency(eff: float) -> int:
     return min(200, max(1, int(round(2 ** (1.0 / eff - 1.0)))))
 
 
-def _cold_start_standard(change_type: str, code_region_type: str) -> TaskStandard:
+def _cold_start_standard(
+    change_type: str,
+    code_region_type: str,
+    failure_warning: str | None = None,
+) -> TaskStandard:
+    checklist = ([failure_warning] + list(_GENERIC_CHECKLIST)) if failure_warning else list(_GENERIC_CHECKLIST)
     return TaskStandard(
         change_type=change_type,
         code_region_type=code_region_type,
@@ -200,7 +251,7 @@ def _cold_start_standard(change_type: str, code_region_type: str) -> TaskStandar
             "avg_outcome_quality":  None,
             "avg_prompt_quality":   None,
         },
-        completion_checklist=_GENERIC_CHECKLIST,
+        completion_checklist=checklist,
         signal_tiers={
             "tier1_available": False,
             "tier2_available": False,

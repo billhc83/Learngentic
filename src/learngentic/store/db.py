@@ -49,7 +49,9 @@ _SCHEMA_STATEMENTS = [
         agent_type              TEXT DEFAULT 'claude_code',
         hermes_assessment       REAL,
         assessment_source       TEXT DEFAULT 'pending',
-        hermes_notes            TEXT
+        hermes_notes            TEXT,
+        tool_calls              TEXT,
+        checklist_compliance    REAL
     )""",
     """CREATE TABLE IF NOT EXISTS change_events (
         event_id                TEXT PRIMARY KEY,
@@ -115,6 +117,8 @@ _MIGRATIONS = [
     "ALTER TABLE sessions ADD COLUMN hermes_assessment REAL",
     "ALTER TABLE sessions ADD COLUMN assessment_source TEXT DEFAULT 'pending'",
     "ALTER TABLE sessions ADD COLUMN hermes_notes TEXT",
+    "ALTER TABLE sessions ADD COLUMN tool_calls TEXT",
+    "ALTER TABLE sessions ADD COLUMN checklist_compliance REAL",
 ]
 
 _schema_ready = False  # initialise once per process

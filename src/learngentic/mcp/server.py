@@ -14,6 +14,7 @@ Register in Claude Code / Hermes settings as a stdio MCP server.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import threading
 import uuid
@@ -30,10 +31,32 @@ from learngentic.classifier import classify_session
 from learngentic.scoring.efficiency import efficiency_score
 
 app = Server("learngentic")
+_log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Tool-call session tracking (Features 1 + 5)
+# ---------------------------------------------------------------------------
+
+_call_log_lock = threading.Lock()
+# session_id → list of {tool, ts} entries accumulated during the session
+_session_call_log: dict[str, list[dict]] = {}
+# Ring buffer of recent calls (max 50) — used to capture pre-task guidance calls
+# that happen before record_task creates a session_id
+_recent_tool_calls: list[dict] = []
+
+_GUIDANCE_TOOLS = frozenset({
+    "query_risk_assessment",
+    "query_outcome_history",
+    "record_task",
+    "run_local_task",
+    "report_local_result",
+    "report_outcome",
+})
 
 
 def _ensure_api_key() -> None:
-    pass
+    from learngentic.store.db import _load_config
+    _load_config()  # raises RuntimeError with a clear message if credentials are missing
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +156,14 @@ async def list_tools() -> list[Tool]:
                     "is_rewrite":      {"type": "boolean", "description": "Is this rewriting something built recently?"},
                     "turn_count":      {"type": "integer", "description": "Number of internal turns taken"},
                     "hermes_notes":    {"type": "string",  "description": "Optional free-text notes about the task"},
+                    "checklist_passed": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": (
+                            "0-based indices of completion_checklist items you satisfied. "
+                            "Omit if none. Used to compute checklist_compliance rate."
+                        ),
+                    },
                 },
                 "required": ["session_id", "sent_back", "already_existed", "is_rewrite", "turn_count"],
             },
@@ -180,8 +211,22 @@ async def list_tools() -> list[Tool]:
     ]
 
 
+def _record_tool_call(name: str, arguments: dict) -> None:
+    """Log every tool call to the ring buffer and to any active session log."""
+    ts = datetime.now(timezone.utc).isoformat()
+    entry = {"tool": name, "ts": ts}
+    with _call_log_lock:
+        _recent_tool_calls.append(entry)
+        if len(_recent_tool_calls) > 50:
+            _recent_tool_calls.pop(0)
+        session_id = arguments.get("session_id")
+        if session_id and session_id in _session_call_log:
+            _session_call_log[session_id].append(entry)
+
+
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    _record_tool_call(name, arguments)
     if name == "query_risk_assessment":
         result = _risk_assessment(
             prompt=arguments.get("prompt", ""),
@@ -210,6 +255,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             is_rewrite=bool(arguments.get("is_rewrite", False)),
             turn_count=int(arguments.get("turn_count", 1)),
             hermes_notes=arguments.get("hermes_notes", ""),
+            checklist_passed=arguments.get("checklist_passed"),
         )
     elif name == "run_local_task":
         from learngentic.local_tasks.runner import run_local_task
@@ -520,7 +566,8 @@ def _record_task(
                     JOIN sessions s ON s.session_id = ce.session_id
                     WHERE (ce.repo_relative_path = ? OR ce.repo_relative_path LIKE ?)
                       AND ce.event_timestamp > ?
-                """, (fp_posix, f"%/{Path(fp).name}", cutoff)).fetchone()
+                      AND (? = '' OR s.project_id = ?)
+                """, (fp_posix, f"%/{Path(fp).name}", cutoff, project_id, project_id)).fetchone()
                 if row and (row.get("n") or 0) > 0:
                     file_warnings.append({
                         "file": fp,
@@ -529,6 +576,19 @@ def _record_task(
                             "Risk of conflict or duplicate work."
                         ),
                     })
+
+    # Seed session call log — capture any pre-task guidance calls made in the
+    # last 5 minutes (e.g. query_risk_assessment, query_outcome_history)
+    # plus the record_task call itself.
+    pre_task_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    with _call_log_lock:
+        pre_calls = [
+            c for c in _recent_tool_calls
+            if c["ts"] >= pre_task_cutoff
+            and c["tool"] in _GUIDANCE_TOOLS
+            and c["tool"] != "record_task"
+        ]
+        _session_call_log[session_id] = pre_calls + [{"tool": "record_task", "ts": started_at}]
 
     # Generate TaskStandard (reads DB separately)
     from learngentic.standards.generator import generate_standard
@@ -553,6 +613,7 @@ def _report_outcome(
     is_rewrite: bool,
     turn_count: int,
     hermes_notes: str,
+    checklist_passed: list[int] | None = None,
 ) -> dict:
     """
     Close a Hermes task: compute self-assessment, persist it, trigger async
@@ -602,6 +663,26 @@ def _report_outcome(
 
     hermes_assessment = round(max(0.0, min(1.0, score)), 3)
 
+    # ── Checklist compliance (Feature 3) ───────────────────────────────────
+    checklist_compliance: float | None = None
+    if checklist_passed is not None:
+        total_items = len(standard.completion_checklist)
+        valid = [i for i in checklist_passed if 0 <= i < total_items]
+        checklist_compliance = round(len(valid) / max(total_items, 1), 3)
+        breakdown.append(
+            f"checklist_compliance: {len(valid)}/{total_items} items self-reported satisfied"
+        )
+
+    # ── Guidance adherence (Feature 5) ────────────────────────────────────
+    report_ts = datetime.now(timezone.utc).isoformat()
+    with _call_log_lock:
+        session_log = list(_session_call_log.get(session_id, []))
+        session_log.append({"tool": "report_outcome", "ts": report_ts})
+        _session_call_log.pop(session_id, None)
+
+    tools_used = {entry["tool"] for entry in session_log} & _GUIDANCE_TOOLS
+    adherence_rate = round(len(tools_used) / len(_GUIDANCE_TOOLS), 3)
+
     # ── Persist ────────────────────────────────────────────────────────────
     turn_eff_final = efficiency_score(turn_count)
     with get_conn() as conn:
@@ -611,9 +692,14 @@ def _report_outcome(
                 assessment_source    = 'hermes_self',
                 turn_count           = ?,
                 hermes_notes         = ?,
-                execution_efficiency = ?
+                execution_efficiency = ?,
+                tool_calls           = ?,
+                checklist_compliance = ?
             WHERE session_id = ?
-        """, (hermes_assessment, turn_count, hermes_notes or None, turn_eff_final, session_id))
+        """, (
+            hermes_assessment, turn_count, hermes_notes or None, turn_eff_final,
+            json.dumps(session_log), checklist_compliance, session_id,
+        ))
 
     # ── Async git ingest + prompt grading ─────────────────────────────────
     cwd        = session.get("cwd") or ""
@@ -664,6 +750,9 @@ def _report_outcome(
         "score_breakdown": breakdown,
         "standard_confidence": standard.confidence,
         "checklist_items_failed": checklist_failed,
+        "checklist_compliance": checklist_compliance,
+        "guidance_adherence": adherence_rate,
+        "tools_used_this_session": sorted(tools_used),
         "next_steps": next_steps,
         "note": (
             "hermes_assessment is stored separately from outcome_quality. "
@@ -677,7 +766,7 @@ def _fire_git_ingest_async(session_id: str, cwd: str, started_at: str) -> None:
     def _run() -> None:
         try:
             import hashlib
-            from datetime import datetime, timezone
+            from datetime import datetime, timezone, timedelta
             from learngentic.pipeline.git_parser import find_repo_root, parse_repo
             from learngentic.store.db import get_conn, insert_git_change_event
 
@@ -691,10 +780,13 @@ def _fire_git_ingest_async(session_id: str, cwd: str, started_at: str) -> None:
             commits = parse_repo(root)
             started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
 
+            # Partition commits: session commits (after started) vs all others
+            session_commits = [c for c in commits if c.timestamp > started]
+            if not session_commits:
+                return
+
             with get_conn() as conn:
-                for commit in commits:
-                    if commit.timestamp <= started:
-                        continue
+                for commit in session_commits:
                     for file_path in commit.files_changed:
                         event_id = hashlib.sha1(
                             f"{session_id}:{commit.commit_hash}:{file_path}".encode()
@@ -706,8 +798,28 @@ def _fire_git_ingest_async(session_id: str, cwd: str, started_at: str) -> None:
                             repo_relative_path=file_path,
                             event_timestamp=commit.timestamp.isoformat(),
                         )
+
+            # ── Durability computation (Feature 4) ────────────────────────
+            # Durability = fraction of session files NOT re-touched within 7 days
+            session_files = {f for c in session_commits for f in c.files_changed}
+            if session_files:
+                session_end = max(c.timestamp for c in session_commits)
+                window_end = session_end + timedelta(days=7)
+                re_touched: set[str] = set()
+                for commit in commits:
+                    if session_end < commit.timestamp <= window_end:
+                        for f in commit.files_changed:
+                            if f in session_files:
+                                re_touched.add(f)
+                durability = round(1.0 - len(re_touched) / len(session_files), 3)
+                with get_conn() as conn:
+                    # Only write if no durability score already set (don't override human scores)
+                    conn.execute(
+                        "UPDATE sessions SET durability = ? WHERE session_id = ? AND durability IS NULL",
+                        (durability, session_id),
+                    )
         except Exception:
-            pass  # non-critical; never crash the MCP server
+            _log.warning("git ingest background thread failed", exc_info=True)
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -736,7 +848,7 @@ def _fire_prompt_grader_async(
                     WHERE session_id = ?
                 """, (result.prompt_quality, json.dumps(result.failure_modes), session_id))
         except Exception:
-            pass  # non-critical; never crash the MCP server
+            _log.warning("prompt grader background thread failed", exc_info=True)
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -774,7 +886,11 @@ def _keyword_classify(text: str) -> tuple[str, str]:
     elif any(w in t for w in ("db", "database", "model", "schema", "migration", "query", "sql")):
         code_region = "data_layer"
     elif any(w in t for w in ("config", "setting", "env", "deploy", "ci", "pipeline")):
-        code_region = "config"
+        code_region = "infrastructure"
+    elif any(w in t for w in ("test", "spec", "coverage")):
+        code_region = "testing"
+    elif any(w in t for w in ("tool", "script", "make", "hook")):
+        code_region = "tooling"
     else:
         code_region = "unknown"
 
