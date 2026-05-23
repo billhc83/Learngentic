@@ -1,26 +1,4 @@
 {
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "echo '[Learngentic] RULES: (1) call record_task before any multi-step task. (2) use run_local_task for ALL local model work — never curl. (3) after run_local_task: call report_local_result. (4) call report_outcome before declaring done.'"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/mnt/data/projects/Learngentic/.venv/bin/python3 /mnt/data/projects/Learngentic/.claude/hooks/check_open_sessions.py"
-          }
-        ]
-      }
-    ]
-  },
   "permissions": {
     "allow": [
       "Bash(.venv/bin/python3 -c ' *)",
@@ -33,13 +11,17 @@
       "Bash(git -C /mnt/data/projects/Learngentic diff HEAD)"
     ]
   },
-  "mcpServers": {
-    "learngentic": {
-      "command": "/mnt/data/projects/Learngentic/.venv/bin/python3",
-      "args": [
-        "-m",
-        "learngentic.mcp.server"
-      ]
-    }
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/mnt/data/projects/Learngentic/.venv/bin/learngentic track-tool-use"
+          }
+        ]
+      }
+    ]
   }
 }

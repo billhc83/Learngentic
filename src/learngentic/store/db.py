@@ -103,6 +103,15 @@ _SCHEMA_STATEMENTS = [
         local_capable   INTEGER,
         created_at      TEXT NOT NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS tool_events (
+        event_id    TEXT PRIMARY KEY,
+        session_id  TEXT,
+        tool_name   TEXT NOT NULL,
+        file_path   TEXT,
+        cwd         TEXT,
+        timestamp   TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_te_session ON tool_events(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_lmr_task_type ON local_model_runs(task_type)",
     "CREATE INDEX IF NOT EXISTS idx_lmr_session   ON local_model_runs(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_ce_session ON change_events(session_id)",
@@ -119,22 +128,30 @@ _MIGRATIONS = [
     "ALTER TABLE sessions ADD COLUMN hermes_notes TEXT",
     "ALTER TABLE sessions ADD COLUMN tool_calls TEXT",
     "ALTER TABLE sessions ADD COLUMN checklist_compliance REAL",
+    "ALTER TABLE sessions ADD COLUMN files_mentioned TEXT",
+    "ALTER TABLE sessions ADD COLUMN objective_turn_count INTEGER",
+    "ALTER TABLE sessions ADD COLUMN scope_expansion_ratio REAL",
 ]
 
 _schema_ready = False  # initialise once per process
+_config_cache: tuple[str, str] | None = None  # cached after first read
 
 # ---------------------------------------------------------------------------
 # Turso HTTP client
 # ---------------------------------------------------------------------------
 
 def _load_config() -> tuple[str, str]:
+    global _config_cache
+    if _config_cache is not None:
+        return _config_cache
     try:
         cfg = json.loads(_CONFIG_PATH.read_text())
         url = cfg.get("turso_url", "")
         token = cfg.get("turso_auth_token", "")
         if not url or not token:
             raise KeyError
-        return url, token
+        _config_cache = (url, token)
+        return _config_cache
     except (OSError, json.JSONDecodeError, KeyError) as exc:
         raise RuntimeError(
             f"Turso credentials missing from {_CONFIG_PATH}. "
@@ -400,6 +417,22 @@ def insert_git_change_event(
         ) VALUES (?, ?, ?, ?, 'git', 0)
         ON CONFLICT(event_id) DO NOTHING
     """, (event_id, session_id, repo_relative_path, event_timestamp))
+
+
+def insert_tool_events_batch(conn: _TursoConnection, events: list[dict]) -> None:
+    """Batch-insert tool_events rows, ignoring duplicates."""
+    queries = [
+        (
+            """
+            INSERT INTO tool_events (event_id, session_id, tool_name, file_path, cwd, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO NOTHING
+            """,
+            (e["event_id"], e["session_id"], e["tool_name"], e.get("file_path"), e.get("cwd"), e["timestamp"])
+        )
+        for e in events
+    ]
+    conn.batch(queries)
 
 
 def get_sessions_without_git_signals(conn: _TursoConnection) -> list[dict]:

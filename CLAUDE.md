@@ -17,12 +17,25 @@ server. **Never** call the Ollama HTTP API directly — no `curl`, no raw `opena
 no `requests`. Bypassing `run_local_task` skips classification, model selection, and
 logging, which breaks the feedback loop entirely.
 
-### 3. Call `report_local_result` after every `run_local_task`
-Once you have reviewed the output from `run_local_task`, immediately call
-`report_local_result` with your verdict: `pass` if you accept it, `fail` if you are
-retrying, `gave_up` after 5 failed attempts. This is the signal the system trains on.
+### 3. Use local model output VERBATIM — never edit or refine it
+The output of `run_local_task` must be used **exactly as returned** — no paraphrasing,
+no "slight refinements", no typo fixes, no restructuring. You are a conduit, not an editor.
 
-### 4. Call `report_outcome` before declaring done
+**If the output is not good enough to use as-is, the verdict is `fail`.** Re-run with
+`attempt_number` incremented and a better `system_prompt_override`. Keep trying until you
+can accept the raw output, or give up after 5 attempts.
+
+**`pass` means the raw, unmodified output was used.** Editing the output and then
+reporting `pass` is a false signal that destroys training data. It is equivalent to
+fabricating experimental results.
+
+### 4. Call `report_local_result` after every `run_local_task`
+Once you have reviewed the output from `run_local_task`, immediately call
+`report_local_result` with your verdict: `pass` if you accepted and used it verbatim,
+`fail` if it was not usable and you are retrying, `gave_up` after 5 failed attempts.
+This is the signal the system trains on.
+
+### 5. Call `report_outcome` before declaring done
 You may not tell the user a task is complete until you have called `report_outcome` and
 received a verdict. If the verdict is `fail`, share `next_steps` with the user before
 closing the session.
@@ -89,6 +102,11 @@ Call `run_local_task`:
 If `local_capable` is `false` in the response, handle the task yourself — do not retry.
 On a failed attempt, call again with `attempt_number` incremented, `previous_run_id` set
 to the last `run_id`, and a refined `system_prompt_override`. Max 5 attempts.
+
+**The output must be used verbatim or not at all.** Evaluate the raw output: if you would
+accept it unchanged, that is a `pass`. If you would need to edit it, that is a `fail` —
+do not edit it, re-run instead. Never say "I refined it slightly" — that is a data
+integrity violation.
 
 After evaluating the output, immediately call `report_local_result`:
 

@@ -13,6 +13,7 @@ Register in Claude Code / Hermes settings as a stdio MCP server.
 """
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import math
@@ -42,7 +43,7 @@ _call_log_lock = threading.Lock()
 _session_call_log: dict[str, list[dict]] = {}
 # Ring buffer of recent calls (max 50) — used to capture pre-task guidance calls
 # that happen before record_task creates a session_id
-_recent_tool_calls: list[dict] = []
+_recent_tool_calls: collections.deque[dict] = collections.deque(maxlen=50)
 
 _GUIDANCE_TOOLS = frozenset({
     "query_risk_assessment",
@@ -217,8 +218,6 @@ def _record_tool_call(name: str, arguments: dict) -> None:
     entry = {"tool": name, "ts": ts}
     with _call_log_lock:
         _recent_tool_calls.append(entry)
-        if len(_recent_tool_calls) > 50:
-            _recent_tool_calls.pop(0)
         session_id = arguments.get("session_id")
         if session_id and session_id in _session_call_log:
             _session_call_log[session_id].append(entry)
@@ -549,10 +548,11 @@ def _record_task(
             INSERT INTO sessions (
                 session_id, project_id, cwd, started_at,
                 initial_prompt, agent_type, change_type, code_region_type,
-                assessment_source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                assessment_source, files_mentioned
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
         """, (session_id, project_id, cwd, started_at, prompt,
-              agent_type or "hermes", change_type, code_region))
+              agent_type or "hermes", change_type, code_region,
+              json.dumps(files_mentioned) if files_mentioned else None))
 
         # Layer-2 memory: flag files touched in the last 24 hours
         file_warnings: list[dict] = []
@@ -590,15 +590,34 @@ def _record_task(
         ]
         _session_call_log[session_id] = pre_calls + [{"tool": "record_task", "ts": started_at}]
 
+    # Write session pointer so the PostToolUse hook can associate events
+    _write_current_session(session_id, cwd, files_mentioned or [])
+
     # Generate TaskStandard (reads DB separately)
     from learngentic.standards.generator import generate_standard
     standard = generate_standard(change_type, code_region)
+
+    # Fetch recent prompt_quality scores so Claude can see its own track record
+    recent_pq: list[float] = []
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("""
+                SELECT prompt_quality FROM sessions
+                WHERE change_type = ? AND code_region_type = ?
+                  AND prompt_quality IS NOT NULL
+                ORDER BY started_at DESC
+                LIMIT 5
+            """, (change_type, code_region)).fetchall()
+        recent_pq = [round(r["prompt_quality"], 3) for r in rows]
+    except Exception:
+        pass
 
     return {
         "session_id": session_id,
         "classified_as": {"change_type": change_type, "code_region_type": code_region},
         "standard": standard.to_dict(),
         "file_recency_warnings": file_warnings,
+        "prompt_quality_history": recent_pq,
     }
 
 
@@ -661,6 +680,24 @@ def _report_outcome(
             f"efficiency_bonus: turn_count={turn_count}, eff={turn_eff:.3f} ≥ threshold={threshold:.3f}  +{bonus}"
         )
 
+    # ── Objective signals from hook-observed tool events ──────────────────
+    session_events = _sync_tool_event_buffer(session_id)
+    files_mentioned_raw = session.get("files_mentioned") or "[]"
+    try:
+        files_mentioned_list = json.loads(files_mentioned_raw) if isinstance(files_mentioned_raw, str) else files_mentioned_raw
+    except Exception:
+        files_mentioned_list = []
+
+    obj = _compute_objective_signals(session_events, files_mentioned_list, standard, turn_count)
+
+    if obj["overrun_penalty"] > 0:
+        score -= obj["overrun_penalty"]
+        breakdown.append(
+            f"overrun_penalty: objective_turns={obj['objective_turn_count']} "
+            f"> 2× expected_high={standard.benchmarks.get('expected_turns_high')}  "
+            f"−{obj['overrun_penalty']}"
+        )
+
     hermes_assessment = round(max(0.0, min(1.0, score)), 3)
 
     # ── Checklist compliance (Feature 3) ───────────────────────────────────
@@ -688,24 +725,29 @@ def _report_outcome(
     with get_conn() as conn:
         conn.execute("""
             UPDATE sessions SET
-                hermes_assessment    = ?,
-                assessment_source    = 'hermes_self',
-                turn_count           = ?,
-                hermes_notes         = ?,
-                execution_efficiency = ?,
-                tool_calls           = ?,
-                checklist_compliance = ?
+                hermes_assessment     = ?,
+                assessment_source     = 'hermes_self',
+                turn_count            = ?,
+                hermes_notes          = ?,
+                execution_efficiency  = ?,
+                tool_calls            = ?,
+                checklist_compliance  = ?,
+                objective_turn_count  = ?,
+                scope_expansion_ratio = ?
             WHERE session_id = ?
         """, (
             hermes_assessment, turn_count, hermes_notes or None, turn_eff_final,
-            json.dumps(session_log), checklist_compliance, session_id,
+            json.dumps(session_log), checklist_compliance,
+            obj["objective_turn_count"] or None,
+            obj["scope_expansion_ratio"],
+            session_id,
         ))
 
     # ── Async git ingest + prompt grading ─────────────────────────────────
     cwd        = session.get("cwd") or ""
     started_at = session.get("started_at") or ""
     _fire_git_ingest_async(session_id, cwd, started_at)
-    _fire_prompt_grader_async(session_id, prompt, turn_count, hermes_assessment)
+    _fire_prompt_grader_async(session_id, prompt, turn_count, hermes_assessment, cwd, started_at)
 
     # ── Verdict against standard ───────────────────────────────────────────
     # Map each negative signal to the checklist item it violated.
@@ -743,6 +785,20 @@ def _report_outcome(
             "Consider breaking into smaller tasks."
         )
 
+    # Flag significant divergences for visibility
+    obj_warnings: list[str] = []
+    if obj["turn_divergence"] is not None and obj["turn_divergence"] > 0.5:
+        obj_warnings.append(
+            f"turn_count divergence: self-reported {turn_count} vs "
+            f"observed {obj['objective_turn_count']} "
+            f"(delta {obj['turn_divergence']:.0%})"
+        )
+    if obj["scope_expansion_ratio"] is not None and obj["scope_expansion_ratio"] > 0.5:
+        obj_warnings.append(
+            f"scope expansion: {obj['scope_expansion_ratio']:.0%} of edits "
+            f"outside declared files_mentioned"
+        )
+
     return {
         "session_id": session_id,
         "verdict": verdict,
@@ -753,11 +809,117 @@ def _report_outcome(
         "checklist_compliance": checklist_compliance,
         "guidance_adherence": adherence_rate,
         "tools_used_this_session": sorted(tools_used),
+        "objective_signals": {
+            "observed_tool_calls": obj["objective_turn_count"],
+            "self_reported_turns": turn_count,
+            "turn_divergence": obj["turn_divergence"],
+            "scope_expansion_ratio": obj["scope_expansion_ratio"],
+            "edited_files": obj["edited_files"],
+        },
+        "objective_warnings": obj_warnings,
         "next_steps": next_steps,
         "note": (
             "hermes_assessment is stored separately from outcome_quality. "
             "Git signals arriving after a push may override this via 'git_grounded'."
         ),
+    }
+
+
+_SESSION_FILE = Path.home() / ".learngentic" / "current_session.json"
+_BUFFER_FILE  = Path.home() / ".learngentic" / "tool_event_buffer.jsonl"
+
+
+def _write_current_session(session_id: str, cwd: str, files_mentioned: list[str]) -> None:
+    try:
+        _SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _SESSION_FILE.write_text(json.dumps({
+            "session_id": session_id,
+            "cwd": cwd,
+            "files_mentioned": files_mentioned,
+        }))
+    except Exception:
+        pass
+
+
+def _sync_tool_event_buffer(session_id: str) -> list[dict]:
+    """Read the local JSONL buffer, batch-insert all events to Turso, return session's events."""
+    if not _BUFFER_FILE.exists():
+        return []
+    try:
+        lines = _BUFFER_FILE.read_text().splitlines()
+    except Exception:
+        return []
+
+    events: list[dict] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
+    if not events:
+        return []
+
+    try:
+        from learngentic.store.db import insert_tool_events_batch
+        with get_conn() as conn:
+            insert_tool_events_batch(conn, events)
+    except Exception:
+        _log.warning("tool event buffer sync failed", exc_info=True)
+
+    return [e for e in events if e.get("session_id") == session_id]
+
+
+def _compute_objective_signals(
+    session_events: list[dict],
+    files_mentioned: list[str],
+    standard,
+    turn_count: int,
+) -> dict:
+    """Derive objective signals from hook-observed tool events."""
+    from pathlib import Path as _Path
+
+    objective_turn_count = len(session_events)
+
+    # Files actually edited (Edit / Write tools only)
+    edit_tools = {"Edit", "Write", "NotebookEdit"}
+    edited_paths = {
+        e["file_path"] for e in session_events
+        if e.get("tool_name") in edit_tools and e.get("file_path")
+    }
+
+    # Scope expansion: fraction of edited files not in files_mentioned
+    scope_expansion_ratio: float | None = None
+    if files_mentioned and edited_paths:
+        mentioned_basenames = {_Path(f).name for f in files_mentioned}
+        edited_basenames   = {_Path(f).name for f in edited_paths}
+        in_scope = edited_basenames & mentioned_basenames
+        scope_expansion_ratio = round(
+            1.0 - len(in_scope) / max(len(edited_basenames), 1), 3
+        )
+
+    # Turn count divergence: how much did Claude under/over-report?
+    turn_divergence: float | None = None
+    if objective_turn_count > 0:
+        turn_divergence = round(
+            abs(turn_count - objective_turn_count) / objective_turn_count, 3
+        )
+
+    # Penalty: objective turns greatly exceed the historical high
+    expected_high = standard.benchmarks.get("expected_turns_high", 9999)
+    overrun_penalty = 0.0
+    if objective_turn_count > expected_high * 2:
+        overrun_penalty = 0.10
+
+    return {
+        "objective_turn_count": objective_turn_count,
+        "edited_files": sorted(edited_paths),
+        "scope_expansion_ratio": scope_expansion_ratio,
+        "turn_divergence": turn_divergence,
+        "overrun_penalty": overrun_penalty,
     }
 
 
@@ -824,19 +986,55 @@ def _fire_git_ingest_async(session_id: str, cwd: str, started_at: str) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _read_claude_jsonl_reprompts(cwd: str, started_at: str) -> list[str]:
+    """Find the Claude Code JSONL for this session and extract mid-session reprompts."""
+    try:
+        slug = "-" + cwd.lstrip("/").replace("/", "-")
+        jsonl_dir = Path.home() / ".claude" / "projects" / slug
+        if not jsonl_dir.is_dir():
+            return []
+
+        try:
+            cutoff = datetime.fromisoformat(started_at.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            cutoff = 0.0
+
+        candidates = [f for f in jsonl_dir.glob("*.jsonl") if f.stat().st_mtime >= cutoff]
+        if not candidates:
+            return []
+
+        jsonl_file = max(candidates, key=lambda f: f.stat().st_mtime)
+        entries: list[dict] = []
+        for line in jsonl_file.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+        from learngentic.scoring.prompt_grader import extract_reprompts
+        return extract_reprompts(entries)
+    except Exception:
+        return []
+
+
 def _fire_prompt_grader_async(
     session_id: str,
     prompt: str,
     turn_count: int,
     hermes_assessment: float,
+    cwd: str = "",
+    started_at: str = "",
 ) -> None:
     """Run the prompt grader in a daemon thread — does not block the MCP response."""
     def _run() -> None:
         try:
             from learngentic.scoring.prompt_grader import grade_session
+            reprompts = _read_claude_jsonl_reprompts(cwd, started_at)
             result = grade_session(
                 initial_prompt=prompt,
-                reprompts=[],
+                reprompts=reprompts,
                 outcome_rating=hermes_assessment,
                 turn_count=turn_count,
             )
