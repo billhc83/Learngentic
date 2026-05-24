@@ -253,6 +253,40 @@ def init(project_dir):
     click.echo(f"[OK] {project_dir} is ready for Learngentic tracking.")
 
 
+@cli.command(name="sync-patterns")
+def sync_patterns():
+    """Re-aggregate sessions into global_patterns so generate_standard uses live data."""
+    from learngentic.store.db import refresh_global_patterns
+    with get_conn() as conn:
+        n = refresh_global_patterns(conn)
+    click.echo(f"[OK] global_patterns: {n} pattern rows upserted from live sessions")
+
+
+@cli.command(name="score")
+@click.option("--verbose", "-v", is_flag=True, help="Print per-session divergence lines.")
+def score(verbose):
+    """Score unscored change_events from git history and roll up durability."""
+    import io
+    import contextlib
+    from learngentic.pipeline.git_scorer import run_incremental
+
+    if verbose:
+        result = run_incremental()
+    else:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = run_incremental()   # <-- result captured INSIDE the with block
+        captured = buf.getvalue()
+        if captured:
+            click.echo(captured, nl=False)
+
+    click.echo(
+        f"[OK] score: repos={result['repos_processed']}  "
+        f"events={result['events_scored']}  "
+        f"sessions={result['sessions_updated']}"
+    )
+
+
 @cli.command(name="status")
 def status():
     failures = 0

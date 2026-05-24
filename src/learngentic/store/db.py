@@ -453,6 +453,79 @@ def get_file_stats(conn: _TursoConnection, repo_relative_path: str) -> dict:
     return row or {}
 
 
+def refresh_global_patterns(conn) -> int:
+    rows = conn.execute("""
+        SELECT change_type, code_region_type,
+               outcome_quality, execution_efficiency, prompt_quality, durability,
+               failure_mode_tags
+        FROM sessions
+        WHERE change_type IS NOT NULL
+          AND code_region_type IS NOT NULL
+          AND (hermes_assessment IS NOT NULL OR outcome_quality IS NOT NULL)
+    """).fetchall()
+
+    if not rows:
+        return 0
+
+    def _avg(col: str, group: list) -> float | None:
+        vals = [r[col] for r in group if r[col] is not None]
+        return sum(vals) / len(vals) if vals else None
+
+    groups: dict[tuple, list] = {}
+    for row in rows:
+        key = (row["change_type"], row["code_region_type"])
+        groups.setdefault(key, []).append(row)
+
+    now = datetime.utcnow().isoformat()
+    upserts = []
+    for (change_type, code_region_type), group in groups.items():
+        mode_counts: dict[str, int] = {}
+        for r in group:
+            tags_raw = r.get("failure_mode_tags")
+            if not tags_raw:
+                continue
+            try:
+                tags = json.loads(tags_raw)
+                if isinstance(tags, list):
+                    for t in tags:
+                        mode_counts[t] = mode_counts.get(t, 0) + 1
+                elif isinstance(tags, dict):
+                    for t, c in tags.items():
+                        mode_counts[t] = mode_counts.get(t, 0) + int(c)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+
+        upserts.append((
+            """INSERT INTO global_patterns
+               (change_type, code_region_type, avg_outcome_quality, avg_efficiency,
+                avg_prompt_quality, avg_durability, common_failure_modes, sample_count, last_updated)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(change_type, code_region_type) DO UPDATE SET
+                   avg_outcome_quality  = excluded.avg_outcome_quality,
+                   avg_efficiency       = excluded.avg_efficiency,
+                   avg_prompt_quality   = excluded.avg_prompt_quality,
+                   avg_durability       = excluded.avg_durability,
+                   common_failure_modes = excluded.common_failure_modes,
+                   sample_count         = excluded.sample_count,
+                   last_updated         = excluded.last_updated""",
+            (
+                change_type,
+                code_region_type,
+                _avg("outcome_quality", group),
+                _avg("execution_efficiency", group),
+                _avg("prompt_quality", group),
+                _avg("durability", group),
+                json.dumps(mode_counts) if mode_counts else None,
+                len(group),
+                now,
+            ),
+        ))
+
+    if upserts:
+        conn.batch(upserts)
+    return len(upserts)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

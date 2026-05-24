@@ -234,6 +234,7 @@ def run_local_task(
     model = _task_model(task_type, cfg)
 
     output = None
+    error = None
     try:
         response = client.chat.completions.create(
             model=model,
@@ -245,7 +246,8 @@ def run_local_task(
         )
         output = response.choices[0].message.content.strip()
     except Exception as exc:
-        output = f"[model_error: {exc}]"
+        output = None
+        error = str(exc)
 
     _log_run(
         run_id=run_id, task_type=task_type, task_description=task_description,
@@ -254,7 +256,7 @@ def run_local_task(
         previous_run_id=previous_run_id, session_id=session_id, local_capable=True,
     )
 
-    return {
+    result = {
         "run_id": run_id,
         "task_type": task_type,
         "local_capable": True,
@@ -262,6 +264,11 @@ def run_local_task(
         "model_used": model,
         "attempt_number": attempt_number,
     }
+
+    if error is not None:
+        result["error"] = error
+
+    return result
 
 
 def report_local_result(run_id: str, verdict: str) -> dict:

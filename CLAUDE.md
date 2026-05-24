@@ -152,6 +152,16 @@ If the verdict is `fail`, share `next_steps` with the user before closing.
 
 ---
 
+### 6. Never write to gate files.
+
+The model must not directly modify any files located in `~/.learngentic/` (such as `config.json`, `rlt_gate.json`, `current_session.json`, `tool_event_buffer.jsonl`, `learngentic.db`) or within the `.claude/hooks/` directory. Modifying these files bypasses the critical run_local_task gate and results in fabricated training data, which is prohibited. Only authorized systems, including the MCP server or designated users, should have write permissions to these locations.
+
+- Do not modify `config.json`, `rlt_gate.json`, `current_session.json`, `tool_event_buffer.jsonl`, `learngentic.db`.
+- Avoid writing to any files in `.claude/hooks/`.
+- Ensure all modifications go through the MCP server or user-controlled processes.
+
+---
+
 ## When to skip `record_task` / `report_outcome`
 
 Only for tasks that are unambiguously trivial: a single read-only lookup, a one-turn

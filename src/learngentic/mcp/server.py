@@ -27,7 +27,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 from learngentic.store.db import get_conn
-from learngentic.store.vector_index import search_similar
+from learngentic.store.vector_index import search_similar, index_session
 from learngentic.classifier import classify_session
 from learngentic.scoring.efficiency import efficiency_score
 
@@ -554,6 +554,11 @@ def _record_task(
               agent_type or "hermes", change_type, code_region,
               json.dumps(files_mentioned) if files_mentioned else None))
 
+        try:
+            index_session(session_id, prompt)
+        except Exception:
+            pass
+
         # Layer-2 memory: flag files touched in the last 24 hours
         file_warnings: list[dict] = []
         if files_mentioned:
@@ -748,6 +753,7 @@ def _report_outcome(
     started_at = session.get("started_at") or ""
     _fire_git_ingest_async(session_id, cwd, started_at)
     _fire_prompt_grader_async(session_id, prompt, turn_count, hermes_assessment, cwd, started_at)
+    _fire_pattern_refresh_async()
 
     # ── Verdict against standard ───────────────────────────────────────────
     # Map each negative signal to the checklist item it violated.
@@ -867,6 +873,7 @@ def _sync_tool_event_buffer(session_id: str) -> list[dict]:
         from learngentic.store.db import insert_tool_events_batch
         with get_conn() as conn:
             insert_tool_events_batch(conn, events)
+        _BUFFER_FILE.write_text("")  # Clear the buffer file after successful sync
     except Exception:
         _log.warning("tool event buffer sync failed", exc_info=True)
 
@@ -1048,6 +1055,17 @@ def _fire_prompt_grader_async(
         except Exception:
             _log.warning("prompt grader background thread failed", exc_info=True)
 
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _fire_pattern_refresh_async() -> None:
+    def _run() -> None:
+        try:
+            from learngentic.store.db import refresh_global_patterns
+            with get_conn() as conn:
+                refresh_global_patterns(conn)
+        except Exception:
+            pass
     threading.Thread(target=_run, daemon=True).start()
 
 
